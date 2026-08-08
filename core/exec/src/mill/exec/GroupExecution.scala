@@ -63,8 +63,16 @@ trait GroupExecution {
     remoteCacheFilter.flatMap(ParseArgs.extractSegments(_).toOption.map(_._2))
 
   // One cache per run: resolve the `--remote-cache-location` backend once, not per task.
+  private lazy val remoteCacheTrace: Option[RemoteCacheTrace] =
+    RemoteCacheTrace.fromEnv(env, workspace)
+
   private lazy val remoteTaskCache: Option[BazelRemoteCache] =
-    remoteCacheLocation.map(BazelRemoteCache.forLocation(_, remoteCacheSalt, workspace))
+    remoteCacheLocation.map(BazelRemoteCache.forLocation(
+      _,
+      remoteCacheSalt,
+      workspace,
+      remoteCacheTrace
+    ))
 
   /** The remote cache for `labelled`, or `None` if not a filter-matching [[Task.Computed]]. */
   private def remoteCacheTarget(labelled: Task.Named[?]): Option[BazelRemoteCache] =
@@ -295,23 +303,61 @@ trait GroupExecution {
     // Fold the group's `sideHash`es into a single order-independent (commutative sum) value for
     // `inputsHash`, and note whether any task is side-effecting (non-zero `sideHash`, see
     // `Task.sideEffectingHash`) so we can force it to re-read rather than serve a cached value.
-    val (sideHashes, hasSideEffects) = group.iterator.foldLeft((0, false)) { case ((sum, has), t) =>
-      val sideHash = t.sideHash
-      (sum + sideHash, has || sideHash != 0)
+    def traceTaskName(task: Task[?]): String = task match {
+      case named: Task.Named[?] => named.ctx.segments.render
+      case _ => task.getClass.getName
     }
 
-    val inputsHash = {
-      val groupSet = group.toSet
-      // The order of tasks within a is unstable, so use `unorderedHash` to
-      // make sure we get a stable hash out of it
-      val externalInputsHash = MurmurHash3.unorderedHash(
-        group.iterator.flatMap(effectiveInputs).filterNot(groupSet.contains)
-          .flatMap(results(_).asSuccess.map(_.value._2))
-      )
-      val scriptsHash = MurmurHash3.unorderedHash(
-        group
-          .iterator
-          .collect { case namedTask: Task.Named[_] =>
+    val sideHashEntries = Option.when(remoteCacheTrace.isDefined) {
+      group.iterator.map(task => traceTaskName(task) -> task.sideHash).toSeq
+    }
+    val (sideHashes, hasSideEffects) = sideHashEntries match {
+      case Some(entries) => (entries.iterator.map(_._2).sum, entries.exists(_._2 != 0))
+      case None =>
+        group.iterator.foldLeft((0, false)) { case ((sum, has), task) =>
+          val sideHash = task.sideHash
+          (sum + sideHash, has || sideHash != 0)
+        }
+    }
+
+    val groupSet = group.toSet
+    val externalInputs = Option.when(remoteCacheTrace.isDefined) {
+      group.iterator
+        .flatMap(effectiveInputs)
+        .filterNot(groupSet.contains)
+        .flatMap(task => results(task).asSuccess.map(result => task -> result.value._2))
+        .toSeq
+    }
+    // The order of tasks within a group is unstable, so use `unorderedHash` to make sure we get a
+    // stable hash out of it. With tracing disabled, retain the original iterator-only path.
+    val externalInputsHash = externalInputs match {
+      case Some(entries) => MurmurHash3.unorderedHash(entries.iterator.map(_._2))
+      case None =>
+        MurmurHash3.unorderedHash(
+          group.iterator
+            .flatMap(effectiveInputs)
+            .filterNot(groupSet.contains)
+            .flatMap(results(_).asSuccess.map(_.value._2))
+        )
+    }
+
+    val scriptSignatures = Option.when(remoteCacheTrace.isDefined) {
+      group.iterator.collect { case namedTask: Task.Named[_] =>
+        CodeSigUtils
+          .allMethodSignatures(
+            namedTask = namedTask,
+            classToTransitiveClasses = classToTransitiveClasses,
+            allTransitiveClassMethods = allTransitiveClassMethods,
+            constructorHashSignatures = constructorHashSignatures
+          )
+          .flatMap(signature => codeSignatures.get(signature).map(signature -> _))
+      }.flatten.toSeq
+    }
+    val scriptsHash = scriptSignatures match {
+      case Some(entries) => MurmurHash3.unorderedHash(entries.iterator.map(_._2))
+      case None =>
+        MurmurHash3.unorderedHash(
+          group.iterator.collect { case namedTask: Task.Named[_] =>
             CodeSigUtils.codeSigForTask(
               namedTask = namedTask,
               classToTransitiveClasses = classToTransitiveClasses,
@@ -319,12 +365,10 @@ trait GroupExecution {
               codeSignatures = codeSignatures,
               constructorHashSignatures = constructorHashSignatures
             )
-          }
-          .flatten
-      )
-
-      externalInputsHash + sideHashes + scriptsHash
+          }.flatten
+        )
     }
+    val inputsHash = externalInputsHash + sideHashes + scriptsHash
 
     terminal match {
       case labelled: Task.Named[_] =>
@@ -358,6 +402,22 @@ trait GroupExecution {
           executionContext = executionContext
         )
         val remoteCache = remoteCacheTarget(labelled)
+        remoteCache.foreach { cache =>
+          remoteCacheTrace.foreach(_.recordTaskKey(
+            task = labelled.ctx.segments.render,
+            inputsHash = inputsHash,
+            externalInputsHash = externalInputsHash,
+            sideHashes = sideHashes,
+            scriptsHash = scriptsHash,
+            externalInputs = externalInputs.getOrElse(Nil).map { case (task, hash) =>
+              traceTaskName(task) -> hash
+            },
+            sideHashEntries = sideHashEntries.getOrElse(Nil),
+            codeSignatures = scriptSignatures.getOrElse(Nil),
+            actionKey = cache.actionCacheKey(inputsHash, labelled.ctx.segments.render),
+            salt = remoteCacheSalt
+          ))
+        }
 
         // Helper to evaluate the task with full caching support
         def evaluateTaskWithCaching(): GroupExecution.Results = {
@@ -841,6 +901,13 @@ trait GroupExecution {
         val valueHash =
           if (labelled.isInstanceOf[Task.Worker[?]]) inputsHash
           else json.hashCode()
+        remoteCacheTrace.foreach(_.recordValue(
+          task = labelled,
+          valueHash = valueHash,
+          hashMode = if (labelled.isInstanceOf[Task.Worker[?]]) "worker-inputs" else "json",
+          json = Some(json),
+          pathRefs = serializedPaths
+        ))
         cacheEntry.write(json, valueHash, inputsHash)
         (valueHash, serializedPaths)
       case _ =>
@@ -865,8 +932,10 @@ trait GroupExecution {
     }
 
   def getValueHash(v: Val, task: Task[?], inputsHash: Int): Int = {
-    if (task.isInstanceOf[Task.Worker[?]]) inputsHash
-    else {
+    if (task.isInstanceOf[Task.Worker[?]]) {
+      remoteCacheTrace.foreach(_.recordValue(task, inputsHash, "worker-inputs", None, Nil))
+      inputsHash
+    } else {
       // Hash the serialized JSON form when the task has a writer, so semantically-equal
       // values with different in-memory hashes (e.g. `Map` iteration order) compare equal.
       // This is the hashing path for non-terminal tasks and non-Named terminals; the Named
@@ -875,18 +944,38 @@ trait GroupExecution {
       // group, but warn since `v.##` is not reproducible and would defeat a shared cache.
       val base = task match {
         case named: Task.Named[_] if named.writerOpt.isDefined =>
-          try upickle.writeJs(v.value)(using
-              named.writerOpt.get.asInstanceOf[upickle.Writer[Any]]
-            ).hashCode()
-          catch {
+          try {
+            remoteCacheTrace match {
+              case Some(trace) =>
+                val (json, serializedPaths) = PathRef.withSerializedPaths {
+                  upickle.writeJs(v.value)(using
+                    named.writerOpt.get.asInstanceOf[upickle.Writer[Any]]
+                  )
+                }
+                val valueHash = json.hashCode()
+                trace.recordValue(named, valueHash, "json", Some(json), serializedPaths)
+                valueHash
+              case None =>
+                upickle.writeJs(v.value)(using
+                  named.writerOpt.get.asInstanceOf[upickle.Writer[Any]]
+                ).hashCode()
+            }
+          } catch {
             case NonFatal(e) =>
               mill.api.daemon.SystemStreams.current.value.err.println(
                 s"Warning: failed to serialize $task for hashing ($e); " +
                   "falling back to a non-reproducible in-memory hash."
               )
-              v.##
+              val valueHash = v.##
+              remoteCacheTrace.foreach(
+                _.recordValue(named, valueHash, "in-memory-fallback", None, Nil)
+              )
+              valueHash
           }
-        case _ => v.##
+        case _ =>
+          val valueHash = v.##
+          remoteCacheTrace.foreach(_.recordValue(task, valueHash, "in-memory", None, Nil))
+          valueHash
       }
       base
     }

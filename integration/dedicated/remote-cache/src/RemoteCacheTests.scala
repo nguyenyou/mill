@@ -20,7 +20,9 @@ object RemoteCacheTests extends UtestIntegrationTestSuite {
   // output dir too, otherwise one block's local cache would satisfy a later one.
   override def allowSharedOutputDir: Boolean = false
 
-  def withServer[T](f: String => T): T = {
+  def withServer[T](f: String => T): T = withServer(requireTraceHeaders = false)(f)
+
+  def withServer[T](requireTraceHeaders: Boolean)(f: String => T): T = {
     val dir = os.temp.dir(prefix = "mill-remote-cache-server")
     val server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0)
     server.createContext(
@@ -30,21 +32,31 @@ object RemoteCacheTests extends UtestIntegrationTestSuite {
           try {
             val rel = exchange.getRequestURI.getPath.stripPrefix("/")
             val file = dir / os.SubPath(rel)
-            exchange.getRequestMethod match {
-              case "PUT" =>
-                val bytes = exchange.getRequestBody.readAllBytes()
-                os.write.over(file, bytes, createFolders = true)
-                exchange.sendResponseHeaders(200, -1)
-              case "GET" if os.exists(file) =>
-                val bytes = os.read.bytes(file)
-                exchange.sendResponseHeaders(200, bytes.length.toLong)
-                exchange.getResponseBody.write(bytes)
-              case "HEAD" if os.exists(file) =>
-                exchange.sendResponseHeaders(200, -1)
-              case "GET" | "HEAD" =>
-                exchange.sendResponseHeaders(404, -1)
-              case _ =>
-                exchange.sendResponseHeaders(405, -1)
+            val hasTraceHeaders = Seq(
+              "X-Mill-Cache-Trace-Run",
+              "X-Mill-Cache-Task",
+              "X-Mill-Cache-Inputs-Hash",
+              "X-Mill-Cache-Action-Key"
+            ).forall(exchange.getRequestHeaders.containsKey)
+            if (requireTraceHeaders && !hasTraceHeaders) {
+              exchange.sendResponseHeaders(400, -1)
+            } else {
+              exchange.getRequestMethod match {
+                case "PUT" =>
+                  val bytes = exchange.getRequestBody.readAllBytes()
+                  os.write.over(file, bytes, createFolders = true)
+                  exchange.sendResponseHeaders(200, -1)
+                case "GET" if os.exists(file) =>
+                  val bytes = os.read.bytes(file)
+                  exchange.sendResponseHeaders(200, bytes.length.toLong)
+                  exchange.getResponseBody.write(bytes)
+                case "HEAD" if os.exists(file) =>
+                  exchange.sendResponseHeaders(200, -1)
+                case "GET" | "HEAD" =>
+                  exchange.sendResponseHeaders(404, -1)
+                case _ =>
+                  exchange.sendResponseHeaders(405, -1)
+              }
             }
           } catch {
             case _: Throwable => exchange.sendResponseHeaders(500, -1)
@@ -97,6 +109,70 @@ object RemoteCacheTests extends UtestIntegrationTestSuite {
         assert(res.isSuccess)
         assert(res.out.contains("cachedTask-value"))
         assert(!evaluated(tester, "cachedTask"))
+      }
+    }
+
+    test("traceExplainsCacheKeyAndRequests") - withServer(requireTraceHeaders = true) { url =>
+      var builderActionKey = ""
+      integrationTest { tester =>
+        val traceFile = tester.workspacePath / "builder-cache-trace.jsonl"
+        val res = tester.eval(
+          ("--remote-cache-location", url, "show", "cachedFile"),
+          env = Map(
+            "MILL_REMOTE_CACHE_TRACE_FILE" -> traceFile.toString,
+            "MILL_REMOTE_CACHE_TRACE_RUN_ID" -> "builder",
+            "MILL_REMOTE_CACHE_TRACE_COMMIT" -> "example-commit"
+          )
+        )
+        assert(res.isSuccess)
+
+        val events = os.read.lines(traceFile).map(line => ujson.read(line))
+        val taskKey = events.find(event =>
+          event("type").str == "task-key" && event("task").str == "cachedFile"
+        ).get
+        builderActionKey = taskKey("actionKey").str
+        assert(taskKey("inputsHash").num.toInt ==
+          taskKey("externalInputsHash").num.toInt +
+          taskKey("sideHashes").num.toInt +
+          taskKey("scriptsHash").num.toInt)
+        assert(events.exists(event =>
+          event("type").str == "cache-request" &&
+            event("operation").str == "PUT" &&
+            event("key").str == s"ac/$builderActionKey" &&
+            event("outcome").str == "status-200"
+        ))
+        assert(events.exists(event =>
+          event("type").str == "value-hash" &&
+            event("task").str == "cachedFile" &&
+            event("pathRefs").arr.nonEmpty &&
+            event("pathRefs").arr.head("contentSha256") != ujson.Null
+        ))
+      }
+
+      integrationTest { tester =>
+        val traceFile = tester.workspacePath / "reader-cache-trace.jsonl"
+        val res = tester.eval(
+          ("--remote-cache-location", url, "show", "cachedFile"),
+          env = Map(
+            "MILL_REMOTE_CACHE_TRACE_FILE" -> traceFile.toString,
+            "MILL_REMOTE_CACHE_TRACE_RUN_ID" -> "reader",
+            "MILL_REMOTE_CACHE_TRACE_COMMIT" -> "example-commit"
+          )
+        )
+        assert(res.isSuccess)
+        assert(!evaluated(tester, "cachedFile"))
+
+        val events = os.read.lines(traceFile).map(line => ujson.read(line))
+        val readerActionKey = events.find(event =>
+          event("type").str == "task-key" && event("task").str == "cachedFile"
+        ).get("actionKey").str
+        assert(readerActionKey == builderActionKey)
+        assert(events.exists(event =>
+          event("type").str == "cache-request" &&
+            event("operation").str == "GET" &&
+            event("key").str == s"ac/$readerActionKey" &&
+            event("outcome").str == "hit"
+        ))
       }
     }
 
