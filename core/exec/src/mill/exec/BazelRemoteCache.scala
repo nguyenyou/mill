@@ -36,11 +36,12 @@ import scala.util.control.NonFatal
  */
 private[mill] class BazelRemoteCache private (
     backend: BazelRemoteCache.Backend,
-    salt: Option[String]
+    salt: Option[String],
+    trace: Option[RemoteCacheTrace]
 ) {
   import BazelRemoteCache.*
 
-  private def actionCacheKey(inputsHash: Int, segmentsRender: String): String = {
+  private[mill] def actionCacheKey(inputsHash: Int, segmentsRender: String): String = {
     val md = MessageDigest.getInstance("SHA-256")
     md.update(ByteBuffer.allocate(4).putInt(inputsHash).array())
     md.update(0.toByte)
@@ -67,14 +68,35 @@ private[mill] class BazelRemoteCache private (
       try writeBlob(paths, pathRefs, out)
       finally out.close()
       val sha = mill.constants.Util.hexArray(digest.digest())
+      val actionKey = actionCacheKey(inputsHash, segmentsRender)
+      val headers = trace.toSeq.flatMap(_.requestHeaders(segmentsRender, inputsHash, actionKey))
 
       // Upload the blob before the AC entry that references it, so a reader never sees an AC
       // entry pointing at a missing blob.
-      if (backend.put(s"cas/$sha", Backend.Body.File(blobFile)))
-        backend.put(
-          s"ac/${actionCacheKey(inputsHash, segmentsRender)}",
-          Backend.Body.Bytes(Protobuf.encodeActionResult(sha, os.size(blobFile)))
+      val casKey = s"cas/$sha"
+      val casResult = backend.put(casKey, Backend.Body.File(blobFile), headers)
+      trace.foreach(_.recordRequest(
+        segmentsRender,
+        "PUT",
+        casKey,
+        actionKey,
+        casResult.outcome
+      ))
+      if (casResult.success) {
+        val acKey = s"ac/$actionKey"
+        val acResult = backend.put(
+          acKey,
+          Backend.Body.Bytes(Protobuf.encodeActionResult(sha, os.size(blobFile))),
+          headers
         )
+        trace.foreach(_.recordRequest(
+          segmentsRender,
+          "PUT",
+          acKey,
+          actionKey,
+          acResult.outcome
+        ))
+      }
     } catch {
       case NonFatal(_) =>
     } finally os.remove(blobFile)
@@ -87,7 +109,12 @@ private[mill] class BazelRemoteCache private (
       segmentsRender: String
   ): Boolean = mill.api.BuildCtx.withFilesystemCheckerDisabled {
     try {
-      backend.get(s"ac/${actionCacheKey(inputsHash, segmentsRender)}").map { is =>
+      val actionKey = actionCacheKey(inputsHash, segmentsRender)
+      val headers = trace.toSeq.flatMap(_.requestHeaders(segmentsRender, inputsHash, actionKey))
+      val acKey = s"ac/$actionKey"
+      val acResult = backend.get(acKey, headers)
+      trace.foreach(_.recordRequest(segmentsRender, "GET", acKey, actionKey, acResult.outcome))
+      acResult.body.map { is =>
         try is.readAllBytes()
         finally is.close()
       } match {
@@ -96,7 +123,12 @@ private[mill] class BazelRemoteCache private (
           Protobuf.decodeBlobDigestHash(acBytes) match {
             case None => false
             case Some(sha) =>
-              backend.get(s"cas/$sha") match {
+              val casKey = s"cas/$sha"
+              val casResult = backend.get(casKey, headers)
+              trace.foreach(
+                _.recordRequest(segmentsRender, "GET", casKey, actionKey, casResult.outcome)
+              )
+              casResult.body match {
                 // Blob evicted or not yet propagated: treat as a miss and recompute.
                 case None => false
                 case Some(is) =>
@@ -129,8 +161,13 @@ private[mill] class BazelRemoteCache private (
 private[mill] object BazelRemoteCache {
 
   /** Build a cache for `location`, parsing the backend (and resolving any `file:`/`~/` path) once. */
-  def forLocation(location: String, salt: Option[String], workspace: os.Path): BazelRemoteCache =
-    new BazelRemoteCache(Backend.forLocation(location, workspace), salt)
+  def forLocation(
+      location: String,
+      salt: Option[String],
+      workspace: os.Path,
+      trace: Option[RemoteCacheTrace] = None
+  ): BazelRemoteCache =
+    new BazelRemoteCache(Backend.forLocation(location, workspace), salt, trace)
 
   private val connectTimeout = Duration.ofSeconds(30)
   private val requestTimeout = Duration.ofSeconds(120)
@@ -243,11 +280,24 @@ private[mill] object BazelRemoteCache {
       PosixFilePermission.OTHERS_EXECUTE
 
   private trait Backend {
-    def get(key: String): Option[InputStream]
-    def put(key: String, body: Backend.Body): Boolean
+    def get(key: String, headers: Seq[(String, String)]): Backend.GetResult
+    def put(
+        key: String,
+        body: Backend.Body,
+        headers: Seq[(String, String)]
+    ): Backend.PutResult
   }
 
   private object Backend {
+    case class GetResult(body: Option[InputStream], status: Int) {
+      def outcome: String = if (status == 200) "hit" else s"status-$status"
+    }
+
+    case class PutResult(status: Int) {
+      def success: Boolean = status / 100 == 2
+      def outcome: String = s"status-$status"
+    }
+
     enum Body {
       case File(file: os.Path)
       case Bytes(bytes: Array[Byte])
@@ -264,33 +314,49 @@ private[mill] object BazelRemoteCache {
   }
 
   private class HttpBackend(baseUrl: String) extends Backend {
-    private def requestBuilder(key: String): HttpRequest.Builder = {
+    private def requestBuilder(
+        key: String,
+        headers: Seq[(String, String)]
+    ): HttpRequest.Builder = {
       val b = HttpRequest.newBuilder(URI.create(s"$baseUrl/$key")).timeout(requestTimeout)
-      authHeader.fold(b)(h => b.header("Authorization", h))
+      headers.foreach { case (name, value) => b.header(name, value) }
+      authHeader.fold(b)(header => b.header("Authorization", header))
     }
-    def get(key: String): Option[InputStream] = {
+    def get(key: String, headers: Seq[(String, String)]): Backend.GetResult = {
       val resp =
-        client.send(requestBuilder(key).GET().build(), HttpResponse.BodyHandlers.ofInputStream())
-      if (resp.statusCode() == 200) Some(resp.body())
-      else { resp.body().close(); None }
+        client.send(
+          requestBuilder(key, headers).GET().build(),
+          HttpResponse.BodyHandlers.ofInputStream()
+        )
+      if (resp.statusCode() == 200) Backend.GetResult(Some(resp.body()), resp.statusCode())
+      else {
+        resp.body().close()
+        Backend.GetResult(None, resp.statusCode())
+      }
     }
-    def put(key: String, body: Backend.Body): Boolean = {
+    def put(
+        key: String,
+        body: Backend.Body,
+        headers: Seq[(String, String)]
+    ): Backend.PutResult = {
       val publisher = body match {
         case Backend.Body.File(file) => HttpRequest.BodyPublishers.ofFile(file.wrapped)
         case Backend.Body.Bytes(bytes) => HttpRequest.BodyPublishers.ofByteArray(bytes)
       }
-      client.send(
-        requestBuilder(key).PUT(publisher).build(),
+      val response = client.send(
+        requestBuilder(key, headers).PUT(publisher).build(),
         HttpResponse.BodyHandlers.discarding()
-      ).statusCode() / 100 == 2
+      )
+      Backend.PutResult(response.statusCode())
     }
   }
 
   private class FileBackend(dir: os.Path) extends Backend {
     private def path(key: String): os.Path = dir / os.SubPath(key)
-    def get(key: String): Option[InputStream] = {
+    def get(key: String, headers: Seq[(String, String)]): Backend.GetResult = {
       val p = path(key)
-      Option.when(os.exists(p))(os.read.inputStream(p))
+      if (os.exists(p)) Backend.GetResult(Some(os.read.inputStream(p)), 200)
+      else Backend.GetResult(None, 404)
     }
     // A torn read of these entries (truncated CAS blob or AC protobuf) is already handled
     // downstream: the CAS blob is written before the AC entry that references it, gzip's CRC32
@@ -298,12 +364,16 @@ private[mill] object BazelRemoteCache {
     // which surface as a cache miss and a clean recompute (never corruption), so a plain overwrite
     // is sufficient. (An atomic temp+rename was tried but gave temp files restrictive `0600` perms,
     // breaking cross-user reads on the shared-folder backend it was meant to help.)
-    def put(key: String, body: Backend.Body): Boolean = {
+    def put(
+        key: String,
+        body: Backend.Body,
+        headers: Seq[(String, String)]
+    ): Backend.PutResult = {
       body match {
         case Backend.Body.File(file) => os.copy.over(file, path(key), createFolders = true)
         case Backend.Body.Bytes(bytes) => os.write.over(path(key), bytes, createFolders = true)
       }
-      true
+      Backend.PutResult(200)
     }
   }
 
